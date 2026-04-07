@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
+	"image/png"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/fogleman/gg"
@@ -14,6 +18,8 @@ type RizRenderer struct {
 	chart       *Chart
 	info        ChartInfo
 	canvasCalcs map[int]*CanvasCalc
+	textures    map[string]image.Image
+	tintCache   map[string]image.Image
 }
 
 type LineSegment struct {
@@ -69,7 +75,113 @@ func NewRizRenderer(chart *Chart) *RizRenderer {
 		chart:       chart,
 		info:        info,
 		canvasCalcs: canvasCalcs,
+		textures:    loadRizTextures(),
+		tintCache:   make(map[string]image.Image),
 	}
+}
+
+func loadRizTextures() map[string]image.Image {
+	textures := make(map[string]image.Image)
+	baseDir := `C:\Users\71957\Desktop\RizPlayer\resources\textures`
+	files := map[string]string{
+		"NoteBackground":  "NoteBackground.png",
+		"Circle":          "Circle.png",
+		"project_tl_drag": "project_tl_drag.png",
+		"Ring_40px":       "Ring_40px.png",
+		"HoldLine512px":   "HoldLine512px.png",
+	}
+
+	for key, name := range files {
+		path := filepath.Join(baseDir, name)
+		file, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		img, err := png.Decode(file)
+		file.Close()
+		if err != nil {
+			continue
+		}
+		textures[key] = img
+	}
+
+	return textures
+}
+
+func (r *RizRenderer) texture(name string) image.Image {
+	if r == nil || r.textures == nil {
+		return nil
+	}
+	return r.textures[name]
+}
+
+func tintKey(name string, c Color) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d", name, c.R, c.G, c.B, c.A)
+}
+
+func tintImage(src image.Image, tint Color) image.Image {
+	if src == nil {
+		return nil
+	}
+	b := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(dst, dst.Bounds(), image.Transparent, image.Point{}, draw.Src)
+
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r, g, b0, a := src.At(x, y).RGBA()
+			if a == 0 {
+				continue
+			}
+			alpha := uint8(a >> 8)
+			dst.SetNRGBA(x-b.Min.X, y-b.Min.Y, color.NRGBA{
+				R: uint8((uint16(tint.R) * uint16(alpha)) / 255),
+				G: uint8((uint16(tint.G) * uint16(alpha)) / 255),
+				B: uint8((uint16(tint.B) * uint16(alpha)) / 255),
+				A: uint8((uint16(tint.A) * uint16(alpha)) / 255),
+			})
+			_ = r
+			_ = g
+			_ = b0
+		}
+	}
+
+	return dst
+}
+
+func (r *RizRenderer) tintedTexture(name string, tint Color) image.Image {
+	if r == nil {
+		return nil
+	}
+	key := tintKey(name, tint)
+	if img, ok := r.tintCache[key]; ok {
+		return img
+	}
+	src := r.texture(name)
+	if src == nil {
+		return nil
+	}
+	img := tintImage(src, tint)
+	r.tintCache[key] = img
+	return img
+}
+
+func drawScaledImage(dc *gg.Context, img image.Image, centerX, centerY, width, height float64) {
+	if img == nil || width <= 0 || height <= 0 {
+		return
+	}
+	bounds := img.Bounds()
+	imgW := float64(bounds.Dx())
+	imgH := float64(bounds.Dy())
+	if imgW == 0 || imgH == 0 {
+		return
+	}
+
+	dc.Push()
+	dc.Translate(centerX-width/2, centerY-height/2)
+	dc.Scale(width/imgW, height/imgH)
+	dc.DrawImage(img, 0, 0)
+	dc.Pop()
 }
 
 func (r *RizRenderer) Render(config RizConfig) (*image.RGBA, error) {
@@ -319,86 +431,121 @@ func (r *RizRenderer) drawJudgeLineSegments(dc *gg.Context, colX, colSecStart, c
 		dc.SetLineCap(gg.LineCapRound)
 		dc.SetLineJoin(gg.LineJoinRound)
 
-		pathStarted := false
-		var curColor color.RGBA
-
 		for segI, seg := range lineSegs {
-			defaultColor := Color{R: 200, G: 200, B: 200, A: 255}
-			pointColor := defaultColor
-			if seg.P1.Color.A > 0 || seg.P1.Color.R > 0 || seg.P1.Color.G > 0 || seg.P1.Color.B > 0 {
-				pointColor = seg.P1.Color
+			canvasOff1 := r.getCanvasXOffset(seg.P1.Time, seg.P1.CanvasIndex)
+			canvasOff2 := r.getCanvasXOffset(seg.P2.Time, seg.P2.CanvasIndex)
+			isVerticalLine := math.Abs(seg.P1.XPosition-seg.P2.XPosition) < 1e-6
+			fixedCanvasOffset := canvasOff1
+
+			secSpan := math.Abs(seg.P2Sec - seg.P1Sec)
+			xSpan := math.Abs((seg.P2.XPosition + canvasOff2) - (seg.P1.XPosition + canvasOff1))
+			steps := int(math.Ceil(secSpan*6 + xSpan*18))
+			if steps < 16 {
+				steps = 16
 			}
-			var finalColor Color
-			if len(line.LineColor) > 0 {
-				lc := getCurrentColor(line.LineColor, seg.P1.Time)
-				finalColor = mixColorAlpha(pointColor, lc)
-			} else {
-				finalColor = pointColor
+			if steps > 64 {
+				steps = 64
+			}
+			startJ := 0
+			if segI > 0 {
+				startJ = 1
 			}
 
-			if finalColor.A < 10 {
-				if pathStarted {
-					dc.Stroke()
-					pathStarted = false
-				}
+			startColor, endColor := r.getLineSegmentColors(line, seg.P1, seg.P2, 0, 1)
+			if startColor.A < 10 && endColor.A < 10 {
 				continue
 			}
 
-			segColor := color.RGBA{
-				R: finalColor.R,
-				G: finalColor.G,
-				B: finalColor.B,
-				A: uint8(float64(finalColor.A) * 0.6),
-			}
-
-			if pathStarted && segColor != curColor {
-				dc.Stroke()
-				pathStarted = false
-			}
-			dc.SetColor(segColor)
-			curColor = segColor
-
-			canvasOff1 := r.getCanvasXOffset(seg.P1.Time, seg.P1.CanvasIndex)
-			canvasOff2 := r.getCanvasXOffset(seg.P2.Time, seg.P2.CanvasIndex)
-
-			steps := 20
-			startJ := 0
-			if pathStarted && segI > 0 {
-				startJ = 1
-			}
+			pathStarted := false
+			var firstX, firstY, lastX, lastY float64
 
 			for j := startJ; j <= steps; j++ {
 				t := float64(j) / float64(steps)
 				sec := lerp(seg.P1Sec, seg.P2Sec, t)
-				screenY := r.secondsToY(sec, colSecStart, config)
-
-				if screenY < topBound-10 || screenY > bottomBound+10 {
-					if pathStarted {
-						dc.Stroke()
-						pathStarted = false
-					}
+				y := r.secondsToY(sec, colSecStart, config)
+				if y < topBound-10 || y > bottomBound+10 {
 					continue
 				}
 
 				easeT := getEaseValue(seg.P1.EaseType, t)
 				xVal := lerp(seg.P1.XPosition, seg.P2.XPosition, easeT)
-				off := lerp(canvasOff1, canvasOff2, t)
-				xVal += off
-				screenX := xPosToScreenX(xVal, colX, colWidth, config.NoteScale)
+				if isVerticalLine {
+					xVal += fixedCanvasOffset
+				} else {
+					xVal += lerp(canvasOff1, canvasOff2, t)
+				}
+				x := xPosToScreenX(xVal, colX, colWidth, config.NoteScale)
 
 				if !pathStarted {
-					dc.MoveTo(screenX, screenY)
+					dc.NewSubPath()
+					dc.MoveTo(x, y)
+					firstX, firstY = x, y
 					pathStarted = true
 				} else {
-					dc.LineTo(screenX, screenY)
+					dc.LineTo(x, y)
 				}
+				lastX, lastY = x, y
 			}
-		}
 
-		if pathStarted {
-			dc.Stroke()
+			if pathStarted {
+				grad := gg.NewLinearGradient(firstX, firstY, lastX, lastY)
+				grad.AddColorStop(0, color.RGBA{R: startColor.R, G: startColor.G, B: startColor.B, A: startColor.A})
+				grad.AddColorStop(1, color.RGBA{R: endColor.R, G: endColor.G, B: endColor.B, A: endColor.A})
+				dc.SetStrokeStyle(grad)
+				dc.Stroke()
+			}
+
 		}
 	}
+}
+
+func (r *RizRenderer) getLineSegmentColors(line Line, p1, p2 LinePoint, tStart, tEnd float64) (Color, Color) {
+	defaultColor := Color{R: 200, G: 200, B: 200, A: 255}
+	pointColor1 := defaultColor
+	pointColor2 := defaultColor
+	if p1.Color.A > 0 || p1.Color.R > 0 || p1.Color.G > 0 || p1.Color.B > 0 {
+		pointColor1 = p1.Color
+	}
+	if p2.Color.A > 0 || p2.Color.R > 0 || p2.Color.G > 0 || p2.Color.B > 0 {
+		pointColor2 = p2.Color
+	}
+
+	tickStart := lerp(p1.Time, p2.Time, tStart)
+	tickEnd := lerp(p1.Time, p2.Time, tEnd)
+	if len(line.LineColor) == 0 {
+		return pointColor1, pointColor2
+	}
+
+	currentLineColorStart := getCurrentColor(line.LineColor, tickStart)
+	currentLineColorEnd := getCurrentColor(line.LineColor, tickEnd)
+	return mixColorAlpha(pointColor1, currentLineColorStart), mixColorAlpha(pointColor2, currentLineColorEnd)
+}
+
+func (r *RizRenderer) getJudgeRingColor(line Line, tick float64) Color {
+	ringColor := Color{R: 255, G: 255, B: 255, A: 255}
+	if len(line.JudgeRingColor) > 0 {
+		ringColor = getCurrentColor(line.JudgeRingColor, tick)
+	}
+	if len(line.LineColor) > 0 {
+		lineColor := getCurrentColor(line.LineColor, tick)
+		ringColor = mixColorAlpha(ringColor, lineColor)
+	}
+	return ringColor
+}
+
+func (r *RizRenderer) drawJudgeRing(dc *gg.Context, x, y float64, ringColor Color, config RizConfig) {
+	if ringColor.A == 0 {
+		return
+	}
+	if ring := r.texture("Ring_40px"); ring != nil {
+		drawScaledImage(dc, ring, x, y, 32.0*config.NoteScale, 32.0*config.NoteScale)
+		return
+	}
+
+	dc.SetColor(color.RGBA{R: ringColor.R, G: ringColor.G, B: ringColor.B, A: ringColor.A})
+	dc.SetLineWidth(2.0 * config.LineWidthScale)
+	dc.DrawCircle(x, y, 16.0*config.NoteScale)
+	dc.Stroke()
 }
 
 func (r *RizRenderer) drawColumnNotes(dc *gg.Context, colX, colSecStart, colSecEnd float64, allNotes []NoteWithPos, config RizConfig) {
@@ -415,12 +562,10 @@ func (r *RizRenderer) drawColumnNotes(dc *gg.Context, colX, colSecStart, colSecE
 		}
 
 		noteThemeColor := r.getThemeColor(n.Note.Time, 1)
-		tapColor := color.RGBA{R: noteThemeColor.R, G: noteThemeColor.G, B: noteThemeColor.B, A: 255}
+		tapColor := color.RGBA{R: noteThemeColor.R, G: noteThemeColor.G, B: noteThemeColor.B, A: noteThemeColor.A}
 
 		y := r.secondsToY(n.Seconds, colSecStart, config)
-
-		canvasOff := r.getCanvasXOffset(n.Note.Time, n.CanvasIndex)
-		x := xPosToScreenX(n.X+canvasOff, colX, colWidth, config.NoteScale)
+		x := r.getRuntimeNoteX(n.Line, n.Note.Time, colX, colWidth, config)
 
 		topBound := float64(config.PaddingTop) - 20
 		bottomBound := float64(config.PaddingTop+config.ColumnHeight) + 20
@@ -435,12 +580,13 @@ func (r *RizRenderer) drawColumnNotes(dc *gg.Context, colX, colSecStart, colSecE
 				r.drawDragNote(dc, x, y, config)
 			}
 		case 2:
-			endY := r.secondsToY(n.EndSeconds, colSecStart, config)
-			endCanvasOff := 0.0
-			if len(n.Note.OtherInformations) > 0 {
-				endCanvasOff = r.getCanvasXOffset(n.Note.OtherInformations[0], n.EndCanvasIdx)
+			endCanvasIdx := n.EndCanvasIdx
+			if len(n.Note.OtherInformations) > 1 {
+				endCanvasIdx = int(n.Note.OtherInformations[1])
 			}
-			endX := xPosToScreenX(n.EndX+endCanvasOff, colX, colWidth, config.NoteScale)
+			_ = endCanvasIdx
+			endY := r.secondsToY(n.EndSeconds, colSecStart, config)
+			endX := r.getRuntimeNoteX(n.Line, n.EndTimeForRender(), colX, colWidth, config)
 
 			drawY := y
 			drawEndY := endY
@@ -458,26 +604,90 @@ func (r *RizRenderer) drawColumnNotes(dc *gg.Context, colX, colSecStart, colSecE
 	}
 }
 
+func (n *NoteWithPos) EndTimeForRender() float64 {
+	if n.Note.Type == 2 && len(n.Note.OtherInformations) > 0 {
+		return n.Note.OtherInformations[0]
+	}
+	return n.Note.Time
+}
+
+func (r *RizRenderer) getRuntimeNoteX(line *Line, tick, colX, colWidth float64, config RizConfig) float64 {
+	if line == nil || len(line.LinePoints) == 0 {
+		return xPosToScreenX(0, colX, colWidth, config.NoteScale)
+	}
+
+	p1, p2 := getLinePointPairAtTick(line.LinePoints, tick)
+	if p1 == nil {
+		return xPosToScreenX(0, colX, colWidth, config.NoteScale)
+	}
+
+	canvasOff1 := r.getCanvasXOffset(tick, p1.CanvasIndex)
+	x1 := p1.XPosition + canvasOff1
+	if p2 == nil || p1 == p2 || p2.Time <= p1.Time {
+		return xPosToScreenX(x1, colX, colWidth, config.NoteScale)
+	}
+
+	canvasOff2 := r.getCanvasXOffset(tick, p2.CanvasIndex)
+	x2 := p2.XPosition + canvasOff2
+	progress := clamp((tick-p1.Time)/(p2.Time-p1.Time), 0, 1)
+	easeValue := getEaseValue(p1.EaseType, progress)
+	x := lerp(x1, x2, easeValue)
+	return xPosToScreenX(x, colX, colWidth, config.NoteScale)
+}
+
+func (r *RizRenderer) getCanvasFPAtTick(canvasIndex int, tick float64) float64 {
+	if cc, ok := r.canvasCalcs[canvasIndex]; ok {
+		return cc.SpeedToFPAtTick(tick)
+	}
+	return 0
+}
+
+func (r *RizRenderer) fpToY(noteFP, canvasFP, colSecStart float64, config RizConfig) float64 {
+	judgeY := r.secondsToY(colSecStart, colSecStart, config)
+	return judgeY + (noteFP-canvasFP)*config.PixelsPerSec
+}
+
 func (r *RizRenderer) drawTapNote(dc *gg.Context, x, y float64, noteColor color.Color, config RizConfig) {
 	baseRadius := 12.0 * config.NoteScale
 	c := noteColor.(color.RGBA)
+	noteRadius := baseRadius
 
 	dc.SetColor(color.RGBA{50, 50, 50, 153})
-	dc.DrawCircle(x, y, baseRadius*1.15)
+	dc.DrawCircle(x, y, noteRadius*1.15)
 	dc.Fill()
 
-	dc.SetColor(color.RGBA{20, 20, 20, 240})
-	dc.DrawCircle(x, y, baseRadius)
-	dc.Fill()
+	if bg := r.texture("NoteBackground"); bg != nil {
+		drawScaledImage(dc, bg, x, y, noteRadius*2.1, noteRadius*2.1)
+	} else {
+		dc.SetColor(color.RGBA{20, 20, 20, 240})
+		dc.DrawCircle(x, y, noteRadius)
+		dc.Fill()
+	}
 
-	innerR := baseRadius * 0.62
-	dc.SetColor(color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
-	dc.DrawCircle(x, y, innerR)
-	dc.Fill()
+	innerR := noteRadius * 0.62
+	if circle := r.texture("Circle"); circle != nil {
+		tinted := r.tintedTexture("Circle", Color{R: c.R, G: c.G, B: c.B, A: c.A})
+		if tinted != nil {
+			drawScaledImage(dc, tinted, x, y, innerR*2, innerR*2)
+		} else {
+			drawScaledImage(dc, circle, x, y, innerR*2, innerR*2)
+			dc.SetColor(color.RGBA{R: c.R, G: c.G, B: c.B, A: c.A})
+			dc.DrawCircle(x, y, innerR)
+			dc.Fill()
+		}
+	} else {
+		dc.SetColor(color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
+		dc.DrawCircle(x, y, innerR)
+		dc.Fill()
+	}
 }
 
 func (r *RizRenderer) drawDragNote(dc *gg.Context, x, y float64, config RizConfig) {
-	baseRadius := 8.0 * config.NoteScale
+	baseRadius := 15.0 * config.NoteScale
+	if drag := r.texture("project_tl_drag"); drag != nil {
+		drawScaledImage(dc, drag, x, y, baseRadius*2, baseRadius*2)
+		return
+	}
 
 	dc.SetColor(color.RGBA{0, 0, 0, 255})
 	dc.DrawCircle(x, y, baseRadius)
@@ -491,51 +701,35 @@ func (r *RizRenderer) drawDragNote(dc *gg.Context, x, y float64, config RizConfi
 func (r *RizRenderer) drawHoldNote(dc *gg.Context, x, y, endX, endY float64, noteColor color.Color, config RizConfig) {
 	c := noteColor.(color.RGBA)
 	holdWidth := 12.0 * config.NoteScale
+	_ = endX
 
-	startY := math.Min(y, endY)
-	stopY := math.Max(y, endY)
-	height := stopY - startY
+	startY := y
+	height := y - endY
+	if height > 0 {
+		startY = endY
+	}
+	if math.Abs(height) < 0.001 {
+		height = 0
+	}
 
 	if height > 0 {
-		bands := int(height / 2)
-		if bands < 4 {
-			bands = 4
-		}
-		if bands > 60 {
-			bands = 60
-		}
-		bandH := height / float64(bands)
-		for b := 0; b < bands; b++ {
-			t := float64(b) / float64(bands)
-			headDist := 1.0 - t
-			var alpha float64
-			if headDist <= 0.7 {
-				alpha = 1.0 - 0.2*(headDist/0.7)
-			} else {
-				alpha = 0.8 * (1.0 - (headDist-0.7)/0.3)
-			}
-			if alpha < 0 {
-				alpha = 0
-			}
-			bY := startY + float64(b)*bandH
-			dc.SetColor(color.RGBA{R: c.R, G: c.G, B: c.B, A: uint8(alpha * float64(c.A))})
-			dc.DrawRectangle(x-holdWidth/2, bY, holdWidth, bandH+1)
-			dc.Fill()
-		}
+		grad := gg.NewLinearGradient(x, startY, x, startY+height)
+		grad.AddColorStop(0, color.RGBA{R: c.R, G: c.G, B: c.B, A: c.A})
+		grad.AddColorStop(0.7, color.RGBA{R: c.R, G: c.G, B: c.B, A: uint8(float64(c.A) * 0.8)})
+		grad.AddColorStop(1, color.RGBA{R: c.R, G: c.G, B: c.B, A: 0})
+		dc.SetFillStyle(grad)
+		dc.DrawRectangle(x-holdWidth/2, startY, holdWidth, height)
+		dc.Fill()
 
 		dc.SetColor(color.RGBA{0, 0, 0, 255})
 		dc.SetLineWidth(2.0 * config.NoteScale)
-		dc.DrawLine(x-holdWidth/2, startY, x-holdWidth/2, stopY)
+		dc.DrawLine(x-holdWidth/2, startY, x-holdWidth/2, startY+height)
 		dc.Stroke()
-		dc.DrawLine(x+holdWidth/2, startY, x+holdWidth/2, stopY)
+		dc.DrawLine(x+holdWidth/2, startY, x+holdWidth/2, startY+height)
 		dc.Stroke()
 	}
 
 	r.drawNoteHead(dc, x, y, 12.0*config.NoteScale, color.RGBA{255, 255, 255, 255})
-
-	dc.SetColor(color.RGBA{R: c.R, G: c.G, B: c.B, A: 140})
-	dc.DrawCircle(endX, endY, holdWidth/2*0.8)
-	dc.Fill()
 }
 
 func (r *RizRenderer) drawNoteHead(dc *gg.Context, x, y, baseRadius float64, innerColor color.RGBA) {
@@ -543,13 +737,29 @@ func (r *RizRenderer) drawNoteHead(dc *gg.Context, x, y, baseRadius float64, inn
 	dc.DrawCircle(x, y, baseRadius*1.15)
 	dc.Fill()
 
-	dc.SetColor(color.RGBA{20, 20, 20, 240})
-	dc.DrawCircle(x, y, baseRadius)
-	dc.Fill()
+	if bg := r.texture("NoteBackground"); bg != nil {
+		drawScaledImage(dc, bg, x, y, baseRadius*2.1, baseRadius*2.1)
+	} else {
+		dc.SetColor(color.RGBA{20, 20, 20, 240})
+		dc.DrawCircle(x, y, baseRadius)
+		dc.Fill()
+	}
 
-	dc.SetColor(innerColor)
-	dc.DrawCircle(x, y, baseRadius*0.62)
-	dc.Fill()
+	innerR := baseRadius * 0.62
+	if circle := r.texture("Circle"); circle != nil {
+		tinted := r.tintedTexture("Circle", Color{R: innerColor.R, G: innerColor.G, B: innerColor.B, A: innerColor.A})
+		if tinted != nil {
+			drawScaledImage(dc, tinted, x, y, innerR*2, innerR*2)
+		} else {
+			dc.SetColor(innerColor)
+			dc.DrawCircle(x, y, innerR)
+			dc.Fill()
+		}
+	} else {
+		dc.SetColor(innerColor)
+		dc.DrawCircle(x, y, innerR)
+		dc.Fill()
+	}
 }
 
 func (r *RizRenderer) getThemeColor(tick float64, colorIndex int) Color {
@@ -558,9 +768,16 @@ func (r *RizRenderer) getThemeColor(tick float64, colorIndex int) Color {
 		{R: 200, G: 200, B: 200, A: 255},
 		{R: 200, G: 200, B: 200, A: 255},
 	}
+	if colorIndex < 0 || colorIndex >= len(defaults) {
+		colorIndex = 0
+	}
+
+	if len(r.chart.Themes) == 0 {
+		return defaults[colorIndex]
+	}
 
 	baseColor := defaults[colorIndex]
-	if len(r.chart.Themes) > 0 && colorIndex < len(r.chart.Themes[0].ColorsList) {
+	if colorIndex < len(r.chart.Themes[0].ColorsList) {
 		baseColor = r.chart.Themes[0].ColorsList[colorIndex]
 	}
 
@@ -569,48 +786,41 @@ func (r *RizRenderer) getThemeColor(tick float64, colorIndex int) Color {
 	}
 
 	topP := 0.0
-	topIdx := -1
+	topThemeIdx := 1
 
-	for ctIdx, ct := range r.chart.ChallengeTimes {
-		transTicks := ct.TransTime
-		if transTicks <= 0 {
-			transTicks = 1
+	for i, ct := range r.chart.ChallengeTimes {
+		themeIdx := i + 1
+		if themeIdx >= len(r.chart.Themes) {
+			themeIdx = len(r.chart.Themes) - 1
 		}
 
 		var p float64
-		if tick >= ct.Start && tick < ct.Start+transTicks {
-			raw := (tick - ct.Start) / transTicks
+		if ct.TransTime > 0 && tick >= ct.Start && tick < ct.Start+ct.TransTime {
+			raw := (tick - ct.Start) / ct.TransTime
 			p = getEaseValue(2, raw)
-		} else if tick >= ct.Start+transTicks && tick <= ct.End {
+		} else if tick >= ct.Start+ct.TransTime && tick <= ct.End {
 			p = 1.0
-		} else if tick > ct.End && tick <= ct.End+transTicks {
-			raw := (tick - ct.End) / transTicks
+		} else if ct.TransTime > 0 && tick > ct.End && tick <= ct.End+ct.TransTime {
+			raw := (tick - ct.End) / ct.TransTime
 			p = getEaseValue(2, 1-raw)
 		}
 
+		p = clamp(p, 0, 1)
+
 		if p > topP {
 			topP = p
-			topIdx = ctIdx
+			topThemeIdx = themeIdx
 		}
 	}
 
-	if topP <= 0.001 || topIdx < 0 {
+	if topP <= 0 {
 		return baseColor
 	}
 
-	themeIdx := topIdx + 1
-	if themeIdx >= len(r.chart.Themes) {
-		themeIdx = len(r.chart.Themes) - 1
-	}
 	targetColor := baseColor
-	if colorIndex < len(r.chart.Themes[themeIdx].ColorsList) {
-		targetColor = r.chart.Themes[themeIdx].ColorsList[colorIndex]
+	if topThemeIdx >= 0 && topThemeIdx < len(r.chart.Themes) && colorIndex < len(r.chart.Themes[topThemeIdx].ColorsList) {
+		targetColor = r.chart.Themes[topThemeIdx].ColorsList[colorIndex]
 	}
 
-	return Color{
-		R: uint8(float64(baseColor.R) + (float64(targetColor.R)-float64(baseColor.R))*topP),
-		G: uint8(float64(baseColor.G) + (float64(targetColor.G)-float64(baseColor.G))*topP),
-		B: uint8(float64(baseColor.B) + (float64(targetColor.B)-float64(baseColor.B))*topP),
-		A: uint8(float64(baseColor.A) + (float64(targetColor.A)-float64(baseColor.A))*topP),
-	}
+	return mixColor(baseColor, targetColor, topP)
 }

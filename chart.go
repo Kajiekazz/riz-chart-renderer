@@ -141,8 +141,7 @@ func secondsToTick(seconds float64, bpmShifts []BPMShift, baseBPM float64) float
 	if bpm == 0 {
 		bpm = baseBPM
 	}
-	firstSec := first.Time * (60.0 / bpm)
-	if seconds <= firstSec {
+	if seconds <= first.FloorPosition {
 		return seconds / (60.0 / bpm)
 	}
 
@@ -585,6 +584,28 @@ func getCanvasIndexAtTick(linePoints []LinePoint, tick float64) int {
 	}
 
 	return 0
+}
+
+func getLinePointPairAtTick(linePoints []LinePoint, tick float64) (*LinePoint, *LinePoint) {
+	if len(linePoints) == 0 {
+		return nil, nil
+	}
+
+	targetIndex := 0
+	for i := 0; i < len(linePoints); i++ {
+		if linePoints[i].Time <= tick {
+			targetIndex = i
+		} else {
+			break
+		}
+	}
+
+	p1 := &linePoints[targetIndex]
+	p2 := p1
+	if targetIndex+1 < len(linePoints) {
+		p2 = &linePoints[targetIndex+1]
+	}
+	return p1, p2
 }
 
 func getXPositionAtTick(linePoints []LinePoint, tick float64) float64 {
